@@ -9,3 +9,13 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+# NPU build artifacts
+kernel_meta/
+fusion_result.json
+
+# Model checkpoints (too large for git)
+final_model.pt
+final_model.int8.ptz
+
+# Training logs
+logs/
