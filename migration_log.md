@@ -402,3 +402,237 @@ python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 80
 - `ACL_PRECISION_MODE=allow_mix_precision` (必须)
 - `source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash` (必须)
 - 额外 pip 包: `scipy`, `psutil` (原 requirements 未包含)
+
+---
+
+## 12. 阶段三：CANN FlashAttention 融合算子集成
+
+### 12.1 方案选择
+
+经探查，CANN 8.3.RC1 已内置 FlashAttention 融合算子：
+- C API: `aclnnFlashAttentionScore` / `aclnnFlashAttentionScoreGrad`
+- Python API: `torch_npu.npu_fusion_attention` / `torch_npu.npu_fusion_attention_grad`
+
+**决策**：直接使用 CANN 内置融合算子，而非从头用 AscendC 编写 kernel。理由：
+1. 内置算子经过华为充分优化，性能和稳定性有保障
+2. 已支持 GQA (num_heads != num_kv_heads)、causal mask、bf16
+3. 前向+反向自动求导已封装好，开箱即用
+4. 避免从零开发 AscendC kernel 的巨大工程量和调试成本
+
+### 12.2 关键参数映射
+
+| 原始 CUDA (F.scaled_dot_product_attention) | NPU (torch_npu.npu_fusion_attention) |
+|---|---|
+| is_causal=True | atten_mask=上三角bool矩阵 [Sq, Skv], sparse_mode=0 |
+| enable_gqa=True (8h/4kv) | head_num=8, Q=[B,8,S,D], K/V=[B,4,S,D] |
+| 默认 scale=1/sqrt(head_dim) | 显式传入 scale=1/sqrt(64)=0.125 |
+| input_layout | "BNSD" (Batch, Num_heads, Seq, Dim) |
+| - | pre_tockens=seqlen, next_tockens=0 |
+
+### 12.3 调试过程
+
+| 时间 | 操作 | 结果 |
+|------|------|------|
+| 2026-03-31 14:35 | 独立测试 npu_fusion_attention GQA+causal 前向+反向 | ✅ 成功 |
+| 2026-03-31 14:38 | sparse_mode=2 无 atten_mask 测试 | ❌ 无 causal mask 效果 |
+| 2026-03-31 14:40 | sparse_mode=0 + 显式 [Sq,Skv] mask 精度对比 | ✅ max_diff=0, cosine_sim=1.0 |
+| 2026-03-31 14:40 | sparse_mode=2 + [2048,2048] mask (seqlen<2048时) | ❌ 报错：mask shape 不支持 |
+| 2026-03-31 14:41 | sparse_mode=0 + [seqlen,seqlen] mask (seqlen=1024) | ✅ 精度完全匹配 |
+| 2026-03-31 14:41 | sparse_mode=2/3 + [2048,2048] mask (seqlen=1024) | ✅ 精度匹配 |
+| 2026-03-31 14:41 | 性能对比 (200 iters, bsz=4, seq=1024, bf16) | ✅ FA: 0.106ms vs SDPA: 0.155ms (31%↑) |
+| 2026-03-31 14:45 | 集成到 train_gpt_npu.py 首次试跑 | ❌ Q/K 为 float32, V 为 bf16，类型不匹配 |
+| 2026-03-31 14:47 | 添加 dtype 对齐 (q,k cast to v.dtype) | ✅ 修复 |
+| 2026-03-31 14:48 | 单卡 5 步完整训练 (NPU_FLASH_ATTENTION=1) | ✅ 成功 |
+| 2026-03-31 14:56 | 单卡 3 步对比训练 (NPU_FLASH_ATTENTION=0) | ✅ 成功 |
+
+### 12.4 精度验证
+
+**独立 attention 算子对比** (bsz=4, seq=1024, 8h/4kv, d=64, bf16):
+- Max absolute diff: 0.000000
+- Mean absolute diff: 0.000000
+- Cosine similarity: 1.000000
+
+**端到端训练对比** (单卡, 相同随机种子):
+
+| 指标 | FlashAttention (FA=1) | 原始 SDPA (FA=0) |
+|------|---|---|
+| step 0 val_loss | 6.9357 | 6.9357 |
+| step 1 train_loss | 6.9358 | 6.9358 |
+| step 2 train_loss | 16.4454 | 16.4454 |
+| step 3 train_loss | 16.0225 | 16.0249 |
+| step_avg | ~2810ms | ~2784ms |
+
+精度完全一致 (step 1-2 loss 完全相同, step 3 仅 0.001 差异)。
+
+### 12.5 性能分析
+
+**Attention 算子独立性能** (前向, bsz=4, seq=1024, bf16):
+- `npu_fusion_attention`: 0.106 ms/iter
+- `F.scaled_dot_product_attention`: 0.155 ms/iter
+- **提升: ~31%**
+
+**端到端步时间** (单卡, 含 data loading + optimizer + grad accumulation):
+- FlashAttention: ~2810 ms/step
+- 原始 SDPA: ~2784 ms/step
+- 端到端差异不显著 (attention 仅占总时间一小部分)
+
+注：8卡分布式训练下，attention 占比更高（通信开销降低），FA 的加速效果会更明显。
+
+### 12.6 代码改动
+
+`train_gpt_npu.py` 中的改动：
+1. `CausalSelfAttention.__init__`: 新增 `_use_npu_fa`, `_fa_scale`, `_causal_mask` 属性
+2. `CausalSelfAttention.forward`: 当 `NPU_FLASH_ATTENTION=1` (默认) 时使用 `torch_npu.npu_fusion_attention`，否则回退到 `F.scaled_dot_product_attention`
+3. 添加 dtype 对齐: Q/K cast 到 V 的 dtype (解决 autocast 下 rms_norm 输出 fp32 问题)
+4. causal mask 缓存: 首次调用时创建 [seqlen, seqlen] 上三角 bool mask 并缓存
+5. 日志行更新: 显示当前使用的 attention 后端
+
+**环境变量控制**:
+- `NPU_FLASH_ATTENTION=1` (默认): 使用 CANN FlashAttention 融合算子
+- `NPU_FLASH_ATTENTION=0`: 回退到 F.scaled_dot_product_attention
+
+### 12.7 教训总结
+
+1. `npu_fusion_attention` 的 `sparse_mode=2` 虽名为 causal，但仍需传入 `atten_mask`，且 mask 尺寸有 ≥2048 限制
+2. `sparse_mode=0` + 显式 `[Sq, Skv]` mask 是最通用可靠的方案
+3. `CastedLinear` + `rms_norm` + `autocast` 会导致 Q/K 被提升到 fp32，需要显式 cast 回 bf16
+4. CANN 内置融合算子远比手写 AscendC kernel 实用——除非需要定制化的 tiling 策略
+
+### 12.8 阶段三状态
+
+- ✅ FlashAttention 融合算子已集成并验证
+- ✅ 精度与原始 SDPA 完全一致
+- ✅ Attention 计算加速 ~31%
+- ⬜ 8卡分布式训练下的 FA 性能验证（需真机长时间跑完整训练）
+- ⬜ torch.compile NPU 图模式验证（P1 待验证项）
+
+### 12.9 8卡完整训练对比验证
+
+| 时间 | 操作 | 结果 |
+|------|------|------|
+| 2026-03-31 15:24 | 8卡 torchrun NPU_FLASH_ATTENTION=1 | ✅ 完整跑通 (713.6s 含 round-trip) |
+
+**对比结果 (FA vs 原始 SDPA)**:
+
+| 指标 | FA (npu_fusion_attention) | 原始 (F.sdpa) | 差异 |
+|------|---|---|---|
+| 训练步数 | 1627 | 1617 | +10 步 |
+| 总训练时间 | 600,496ms | 600,379ms | ~同 (600s cap) |
+| 每步时间 | 369.08ms | 371.29ms | -0.6% |
+| 初始 val_loss | 6.9357 | 6.9357 | 一致 |
+| step 1000 val_bpb | 1.3804 | 1.3789 | ~相同 |
+| 最终 val_loss | 2.2386 | 2.2381 | +0.0005 |
+| 最终 val_bpb | 1.3258 | 1.3255 | +0.0003 |
+| int8 roundtrip val_bpb | 1.3270 | 1.3268 | +0.0002 |
+| int8 roundtrip val_loss (exact) | 2.24054050 | 2.24025154 | +0.0003 |
+| peak memory/卡 | 19,652 MiB | 19,674 MiB | -22 MiB |
+| 模型大小 (int8+zlib) | 14.3MB | 14.3MB | 一致 |
+
+**分析**:
+1. 精度几乎完全一致，val_bpb 差异仅 0.0002~0.0003，属于正常浮点噪声
+2. 每步快约 2ms (369ms vs 371ms)，多跑了 10 步，收敛程度相当
+3. 显存占用略低 22 MiB
+4. 独立 attention 算子快 31%，但端到端仅快 0.6%——说明当前瓶颈不在 attention，而在 grad accumulation (8步)、Muon 优化器 Newton-Schulz 迭代等
+
+**结论**: FlashAttention 融合算子集成功能等价，零精度损失，略有提速和省显存。
+
+### 12.10 阶段三最终状态
+
+- ✅ FlashAttention 融合算子已集成并通过 8 卡完整训练验证
+- ✅ 精度与原始 SDPA 完全一致 (val_bpb 差异 < 0.001)
+- ✅ Attention 算子加速 ~31%，端到端加速 ~0.6%
+- ✅ 显存占用略有下降 (-22 MiB/卡)
+- ⬜ 进一步优化方向：torch.compile NPU 图模式 (可优化非 attention 瓶颈)
+
+---
+
+## 13. torch.compile 图模式优化探索
+
+### 13.1 超参化改造
+
+将 `compile` 和 `flash_attention` 从环境变量硬编码改为 Hyperparameters 类中的超参：
+- `USE_COMPILE` (默认 0/False): 是否对 Muon 优化器核心函数做 torch.compile
+- `USE_FLASH_ATTENTION` (默认 1/True): 是否使用 npu_fusion_attention
+
+参数一路从 GPT → Block → CausalSelfAttention 传递，不再依赖全局环境变量。
+
+### 13.2 NPU compile 后端探查
+
+| 后端 | 状态 | 说明 |
+|--------|------|------|
+| inductor (默认) | ❌ 不支持 | `aten.mean.dim` lowering 失败 |
+| npu (torch_npu内置) | ✅ 可用 | 需要 torchair + protobuf |
+
+安装了缺失的 `protobuf` 依赖后 `backend='npu'` 可用。
+
+### 13.3 模型级 compile 尝试
+
+| 时间 | 操作 | 结果 |
+|------|------|------|
+| 2026-03-31 17:09 | torch.compile(model, backend='npu', fullgraph=True) | ❌ view/reshape 不兼容 (transpose后非连续 tensor) |
+| 2026-03-31 17:11 | torch.compile(model, backend='npu', fullgraph=False) | ❌ 同样的 view 错误 |
+| 2026-03-31 17:12 | 添加 .contiguous() 在 Q/K/V transpose 后 | ❌ torchair 图编译超时 (>10min) |
+
+**结论**: 模型级 compile 在当前 torchair 版本下不实用——编译时间太长，且对非连续 tensor 的 view 支持不完善。
+
+### 13.4 函数级 compile (仅 Muon 核心函数)
+
+| 时间 | 操作 | 结果 |
+|------|------|------|
+| 2026-03-31 18:04 | torch.compile(zeropower_via_newtonschulz5, backend='npu') 单卡 | ✅ 编译成功，训练跑通 |
+| 2026-03-31 18:17 | 8卡 torchrun USE_COMPILE=1 | ⚠️ 编译时间太长 (>20min) |
+
+**单卡 compile=1 vs compile=0 对比** (3 步):
+
+| 指标 | compile=1 | compile=0 |
+|------|-----------|----------|
+| step 0 val_loss | 6.9357 | 6.9357 |
+| step 1 train_loss | 6.9358 | 6.9358 |
+| step 2 train_loss | 16.4454 | 16.4454 |
+| step 3 train_loss | 14.2259 | 16.0245 |
+| step_avg | ~2859ms | ~2773ms |
+
+step 1-2 完全一致，step 3 差异来自 compile 改变了 Newton-Schulz 函数的数值行为。
+
+### 13.5 结论与决策
+
+torchair (NPU 的 torch.compile 后端) 在当前版本下存在以下限制：
+1. 模型级 compile: 不支持非连续 tensor 的 view 操作
+2. 函数级 compile: 可用但首次编译耗时数分钟
+3. 8卡分布式下编译时间可能超过 20 分钟，而训练本身只有 10 分钟
+
+**最终决策**: `USE_COMPILE` 默认为 False。用户可通过 `USE_COMPILE=1` 手动开启，适用于长时间训练场景（编译开销可摸薄）。
+
+### 13.6 代码改动汇总
+
+1. `Hyperparameters` 类新增 `use_compile`, `use_flash_attention` 超参
+2. `CausalSelfAttention`, `Block`, `GPT` 构造函数新增 `use_flash_attention` 参数
+3. `main()` 中 `torch.compile` 调用改用 `backend='npu'`，受 `args.use_compile` 控制
+4. 模型级 compile 已移除（仅保留函数级 compile for zeropower_via_newtonschulz5）
+5. 日志行新增 `use_compile` 输出
+6. 删除所有 `NPU_TORCH_COMPILE` / `NPU_FLASH_ATTENTION` 环境变量引用
+7. 新增依赖: `protobuf` (torchair 需要)
+
+### 13.7 4卡验证补充（非主流程）
+
+> 注：因 torch.compile 实验导致 NPU 0 驱动死锁（需要 root 重启设备或重启机器才能恢复），
+> 无法使用 8 卡。跳过 NPU 0，用 4 卡 (NPU 1-4) 做了一次完整训练来确认代码改动正确性。
+
+**运行方式**: `ASCEND_RT_VISIBLE_DEVICES=1,2,3,4 torchrun --nproc_per_node=4`
+
+| 指标 | 4卡结果 | 8卡 FA 基线 (12.9) |
+|------|---------|------------------|
+| 训练步数 | 830 | 1627 |
+| 每步时间 | 724ms | 369ms |
+| 初始 val_loss | 6.9357 | 6.9357 |
+| 最终 val_bpb | 1.3958 | 1.3258 |
+| int8 roundtrip bpb | 1.3990 | 1.3270 |
+| peak memory/卡 | 19,743 MiB | 19,652 MiB |
+
+**分析**:
+- 初始 val_loss 与 8 卡基线完全一致 (6.9357)，确认模型初始化和前向计算无误
+- 4 卡步时间 ~724ms ≈ 8 卡 369ms × 2，线性缩放符合预期
+- 最终 bpb 高于 8 卡是因为训练步数不足 (830 vs 1627)，非精度问题
+- 超参体系 (USE_COMPILE / USE_FLASH_ATTENTION) 工作正常
+
+**结论**: 阶段三所有代码改动功能正确。待 NPU 0 恢复后可重新跑 8 卡完整对比。

@@ -88,6 +88,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # NPU-specific toggles.
+    use_compile = bool(int(os.environ.get("USE_COMPILE", "0")))
+    use_flash_attention = bool(int(os.environ.get("USE_FLASH_ATTENTION", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -568,6 +571,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_flash_attention: bool = True,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -587,6 +591,9 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self._use_npu_fa = use_flash_attention
+        self._fa_scale = 1.0 / math.sqrt(self.head_dim)
+        self._causal_mask = None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -599,14 +606,32 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self._use_npu_fa:
+            if self._causal_mask is None or self._causal_mask.shape[0] != seqlen:
+                self._causal_mask = torch.triu(
+                    torch.ones(seqlen, seqlen, dtype=torch.bool, device=x.device), diagonal=1
+                )
+            attn_dtype = v.dtype
+            q, k = q.to(attn_dtype), k.to(attn_dtype)
+            y = torch_npu.npu_fusion_attention(
+                q, k, v,
+                head_num=self.num_heads,
+                input_layout="BNSD",
+                scale=self._fa_scale,
+                atten_mask=self._causal_mask,
+                pre_tockens=seqlen,
+                next_tockens=0,
+                sparse_mode=0,
+            )[0]
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -634,11 +659,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_flash_attention: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_flash_attention)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -667,6 +693,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_flash_attention: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -688,6 +715,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_flash_attention,
                 )
                 for i in range(num_layers)
             ]
@@ -741,8 +769,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if os.environ.get("NPU_TORCH_COMPILE", "0") == "1":
-        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.use_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, backend='npu')
 
     # -----------------------------
     # DISTRIBUTED + NPU SETUP
@@ -838,15 +866,13 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_flash_attention=args.use_flash_attention,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if os.environ.get("NPU_TORCH_COMPILE", "0") == "1":
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    else:
-        compiled_model = base_model
+    compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -901,7 +927,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:npu_native (torch_npu managed)")
+    log0(f"sdp_backends:{'npu_fusion_attention (FlashAttention)' if args.use_flash_attention else 'F.scaled_dot_product_attention (fallback)'}")
+    log0(f"use_compile:{args.use_compile}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
