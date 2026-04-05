@@ -27,6 +27,15 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from jvp_flash_attention.jvp_attention import JVPAttn
+    HAS_JVP_ATTENTION = True
+except ImportError:
+    JVPAttn = None
+    HAS_JVP_ATTENTION = False
+
+SUPPORTED_JVP_HEAD_DIMS = {16, 32, 64, 128, 256}
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -85,6 +94,12 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Gauss-Newton optimizer settings.
+    gn_mode = bool(int(os.environ.get("GN_MODE", "0")))
+    gn_beta = float(os.environ.get("GN_BETA", 0.9))
+    gn_so_ratio = float(os.environ.get("GN_SO_RATIO", 0.1))
+    gn_inner_lr = float(os.environ.get("GN_INNER_LR", 1e-3))
 
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -586,6 +601,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_jvp_attn = False  # toggled by GaussNewtonOptimizer during JVP
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -601,14 +617,22 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        # Use JVPAttn when in forward-mode AD context (Gauss-Newton optimizer)
+        if self.use_jvp_attn and HAS_JVP_ATTENTION and self.head_dim in SUPPORTED_JVP_HEAD_DIMS:
+            if self.num_kv_heads != self.num_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(n_rep, dim=1)
+                v = v.repeat_interleave(n_rep, dim=1)
+            y = JVPAttn.fwd_dual(q, k, v, attn_mask=None, causal=True)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -710,7 +734,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None, lora=None, *, return_logits: bool = False) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -736,6 +760,8 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if return_logits:
+            return logits
         if lora:
             bsz, sl, V = logits.shape
             return F.cross_entropy(
@@ -1124,6 +1150,36 @@ def main() -> None:
         )
         optimizers.insert(1, optimizer_head)
 
+    # Gauss-Newton optimizer (optional, activated by GN_MODE=1)
+    gn_optimizer = None
+    if args.gn_mode:
+        from gauss_newton import GaussNewtonOptimizer
+
+        gn_param_info = []
+        for name, p in base_model.named_parameters():
+            # Classify each parameter into a group
+            if 'tok_emb' in name:
+                group = 'embed'
+            elif 'lm_head' in name:
+                group = 'head'
+            elif 'blocks.' in name and p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
+                group = 'matrix'
+            else:
+                group = 'scalar'
+            gn_param_info.append({'name': name, 'param': p, 'group': group})
+
+        gn_optimizer = GaussNewtonOptimizer(
+            base_model,
+            gn_param_info,
+            beta=args.gn_beta,
+            so_ratio=args.gn_so_ratio,
+            inner_lr=args.gn_inner_lr,
+            muon_backend_steps=args.muon_backend_steps,
+            vocab_size=args.vocab_size,
+            ref_lr=args.matrix_lr,
+        )
+        log0(f"gn_mode:True beta:{args.gn_beta} so_ratio:{args.gn_so_ratio} inner_lr:{args.gn_inner_lr}")
+
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1238,32 +1294,50 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if args.gn_mode and gn_optimizer is not None:
+            # ----- Gauss-Newton training path -----
+            gn_optimizer.reset_outer_params()
+            train_loss = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    # Loss for logging only (no backward)
+                    with torch.no_grad():
+                        loss = model(x, y)
+                    train_loss += loss.detach()
+                    # GN direction update (uses uncompiled base_model internally)
+                    gn_optimizer.update_direction(x, y)
+            train_loss /= grad_accum_steps
+            gn_optimizer.step(lr_scale=scale)
+        else:
+            # ----- Standard training path -----
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
 
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all()
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * scale
+
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
