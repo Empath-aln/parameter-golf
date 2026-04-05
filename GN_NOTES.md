@@ -238,3 +238,25 @@ GN 模式相比标准训练有显著额外的显存开销，来源于以下几�
 - Muon 优化器: https://kellerjordan.github.io/posts/muon/
 - Frank-Wolfe 方法: 凸优化中的线性极小化预言机方法
 - `torch.func.jvp`: PyTorch 函数化自动微分（正向模式）
+
+## 进展记录
+
+### 2026-04-05: 初始移植完成 (commit 1ee32f2)
+
+完成 GN 优化器到 parameter-golf 的移植，主要改动：
+
+**新增文件:**
+- `gauss_newton.py`: GN 优化器实现 (~230行)，从 `nanogpt-gn-senmiao/Inner_Solver.py` 精简而来
+- `train_gn.sh`: 单 GPU GN 训练启动脚本
+- `GN_NOTES.md`: 本笔记文件
+
+**`train_gpt.py` 改动:**
+- 导入 `jvp_flash_attention.JVPAttn`（可选依赖，import 失败时 fallback）
+- `Hyperparameters` 新增 GN 相关配置：`GN_MODE`, `GN_BETA`, `GN_SO_RATIO`, `GN_INNER_LR`
+- `CausalSelfAttention.forward` 新增 JVPAttn 分支（GN 的 forward-mode AD 需要可微分 attention）
+- `GPT.forward` 新增 `return_logits` 参数（GN 需要拿到 logits 做 Hessian-vector 积）
+- `main()` 中新增 GN 训练路径（与标准 backward 路径并列，由 `GN_MODE` 开关控制）
+
+**修复:**
+- `GN_INNER_LR` 默认值从误改的 `0.04` 恢复为 `1e-3`
+- 恢复 `# TEST-TIME TRAINING (LoRA)` 段落下方被误删的 `# -----------------------------` 分隔线
