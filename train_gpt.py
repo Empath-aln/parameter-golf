@@ -99,7 +99,6 @@ class Hyperparameters:
     gn_mode = bool(int(os.environ.get("GN_MODE", "0")))
     gn_beta = float(os.environ.get("GN_BETA", 0.9))
     gn_so_ratio = float(os.environ.get("GN_SO_RATIO", 0.1))
-    gn_inner_lr = float(os.environ.get("GN_INNER_LR", 1e-3))
 
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -1168,17 +1167,25 @@ def main() -> None:
                 group = 'scalar'
             gn_param_info.append({'name': name, 'param': p, 'group': group})
 
+        gn_group_lrs = {
+            'matrix': args.matrix_lr,
+            'scalar': args.scalar_lr,
+            'embed':  token_lr,
+            'head':   args.head_lr,
+        }
         gn_optimizer = GaussNewtonOptimizer(
             base_model,
             gn_param_info,
             beta=args.gn_beta,
             so_ratio=args.gn_so_ratio,
-            inner_lr=args.gn_inner_lr,
+            group_lrs=gn_group_lrs,
+            muon_momentum=args.muon_momentum,
             muon_backend_steps=args.muon_backend_steps,
+            adam_betas=(args.beta1, args.beta2),
+            adam_eps=args.adam_eps,
             vocab_size=args.vocab_size,
-            ref_lr=args.matrix_lr,
         )
-        log0(f"gn_mode:True beta:{args.gn_beta} so_ratio:{args.gn_so_ratio} inner_lr:{args.gn_inner_lr}")
+        log0(f"gn_mode:True beta:{args.gn_beta} so_ratio:{args.gn_so_ratio} group_lrs:{gn_group_lrs}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1297,6 +1304,9 @@ def main() -> None:
 
         if args.gn_mode and gn_optimizer is not None:
             # ----- Gauss-Newton training path -----
+            gn_optimizer.group_lrs = {k: v * scale for k, v in gn_group_lrs.items()}
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            gn_optimizer.muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
             gn_optimizer.reset_outer_params()
             train_loss = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
@@ -1309,7 +1319,7 @@ def main() -> None:
                     # GN direction update (uses uncompiled base_model internally)
                     gn_optimizer.update_direction(x, y)
             train_loss /= grad_accum_steps
-            gn_optimizer.step(lr_scale=scale)
+            gn_optimizer.step()
         else:
             # ----- Standard training path -----
             zero_grad_all()

@@ -2,11 +2,15 @@
 Gauss-Newton Optimizer for parameter-golf.
 
 Implements the blended GN-Frank-Wolfe update (senmiao_gn variant):
-  1. Compute blended gradient: g_t + η*α * H_t * v_{t-1}
-  2. Update EMA: m_t = β * m_{t-1} + (1-β) * blended_gradient
-  3. LMO: Muon (Newton-Schulz) for 2D matrices, Adam for the rest
-  4. Convex combination: v_t = β * v_{t-1} + (1-β) * s_t
-  5. Apply: param += lr * v_t
+  1. Compute blended gradient (tilde_g): g_t + lr*α * H_t * v_{t-1}
+  2. LMO: feed tilde_g into Muon (Newton-Schulz) for 2D matrices, Adam for the rest
+     (each LMO maintains its own internal momentum, outputs a direction without lr)
+  3. Convex combination: v_t = β * v_{t-1} + (1-β) * s_t
+  4. Apply: param += group_lr * v_t   (per-group learning rate)
+
+The caller updates self.group_lrs with scheduled values each step before
+calling update_direction / step.  The second-order term uses
+group_lrs['matrix'] as reference lr.
 
 Reference: nanogpt-gn-senmiao/Inner_Solver.py
 """
@@ -53,43 +57,49 @@ class GaussNewtonOptimizer:
         *,
         beta: float = 0.9,
         so_ratio: float = 0.1,
-        inner_lr: float = 1e-3,
+        group_lrs: dict[str, float] | None = None,
+        muon_momentum: float = 0.95,
         muon_backend_steps: int = 5,
+        adam_betas: tuple[float, float] = (0.9, 0.95),
+        adam_eps: float = 1e-8,
         vocab_size: int = 1024,
-        ref_lr: float = 0.04,
     ):
         """
         Args:
             base_model: Uncompiled GPT model.
             param_info: List of dicts, one per parameter, with keys:
                 'name': str, 'param': Tensor, 'group': str in {'matrix','scalar','embed','head'}
-            beta: EMA momentum coefficient.
+            beta: FW convex-combination coefficient.
             so_ratio: α, weight of second-order Hessian term.
-            inner_lr: Learning rate for the inner LMO (direction solver).
+            group_lrs: Per-group learning rates, e.g.
+                {'matrix': 0.04, 'scalar': 0.04, 'embed': 0.05, 'head': 0.008}.
+                The caller should update self.group_lrs with scheduled values
+                each step.  The 'matrix' lr is also used as reference for the
+                second-order term (lr*α).
+            muon_momentum: Momentum coefficient for Muon LMO (matches MUON_MOMENTUM).
+                The caller can update self.muon_momentum each step for warmup.
             muon_backend_steps: Newton-Schulz iterations for Muon LMO.
+            adam_betas: (β1, β2) for Adam LMO (matches BETA1, BETA2).
+            adam_eps: Epsilon for Adam LMO (matches ADAM_EPS).
             vocab_size: Model vocab size (needed for one-hot encoding).
-            ref_lr: Reference outer LR used for η in η*α computation.
         """
         self.base_model = base_model
         self.beta = beta
         self.so_ratio = so_ratio
-        self.inner_lr = inner_lr
+        self.group_lrs = group_lrs or {'matrix': 0.04, 'scalar': 0.04, 'embed': 0.05, 'head': 0.008}
+        self.muon_momentum = muon_momentum
         self.muon_backend_steps = muon_backend_steps
+        self.adam_beta1, self.adam_beta2 = adam_betas
+        self.adam_eps = adam_eps
         self.vocab_size = vocab_size
-        self.ref_lr = ref_lr
 
         # Parameter metadata
         self.param_names: list[str] = [info['name'] for info in param_info]
         self.params: list[Tensor] = [info['param'] for info in param_info]
         self.groups: list[str] = [info['group'] for info in param_info]
 
-        n = len(self.params)
-
-        # Direction vectors v_t (persistent across steps for momentum)
+        # Direction vectors v_t (persistent across steps for FW momentum)
         self.direction: list[Tensor] = [torch.zeros_like(p) for p in self.params]
-
-        # EMA buffers m_t
-        self.ema_m: list[Tensor] = [torch.zeros_like(p) for p in self.params]
 
         # Accumulated blended gradient for current outer step
         self.grad_accum: list[Tensor] = [torch.zeros_like(p) for p in self.params]
@@ -144,18 +154,18 @@ class GaussNewtonOptimizer:
         """
         Compute blended GN gradient for one micro-batch and accumulate.
 
-        This computes: g_t + η*α * J^T * H * J * v_{t-1}
+        This computes: g_t + lr*α * J^T * H * J * v_{t-1}
         where:
           - g_t = J^T * (p - y) / (B*S)  [first-order gradient]
           - H = diag(p) - pp^T  [Hessian of CE w.r.t. logits]
           - J = Jacobian of logits w.r.t. params
           - v_{t-1} = self.direction (momentum)
+          - lr = self.lr (set by caller each step)
         """
         param_names = self.param_names
         outer_params = self.outer_params
 
         # functional forward that returns logits
-        # We use the forward_logits method via a wrapper module
         def model_fn(params_tuple):
             param_dict = {name: p for name, p in zip(param_names, params_tuple)}
             return functional_call(
@@ -188,8 +198,8 @@ class GaussNewtonOptimizer:
         pT_dot_jvp = (p * jvp_f).sum(dim=-1, keepdim=True)  # (B, S, 1)
         hvp = p_dot_jvp - p * pT_dot_jvp  # (B, S, V)
 
-        # Blended VJP input
-        eta_alpha = self.ref_lr * self.so_ratio
+        # Blended VJP input: matrix lr * α for second-order term
+        eta_alpha = self.group_lrs['matrix'] * self.so_ratio
         labels_one_hot = F.one_hot(target_ids, num_classes=vocab_size).float()
         vjp_input = ((p - labels_one_hot) + eta_alpha * hvp) / (batch_size * seq_len)
 
@@ -212,14 +222,13 @@ class GaussNewtonOptimizer:
         self.accum_count += 1
 
     @torch.no_grad()
-    def step(self, lr_scale: float = 1.0) -> None:
+    def step(self) -> None:
         """
         Apply one outer GN step:
-        1. Average accumulated gradients
-        2. Update EMA m_t
-        3. Compute LMO direction s_t
-        4. Convex combination v_t = β*v_prev + (1-β)*s_t
-        5. Write updated params
+        1. Average accumulated gradients (tilde_g)
+        2. Feed tilde_g into LMO (Muon / Adam with internal momentum)
+        3. Convex combination v_t = β*v_prev + (1-β)*s_t
+        4. Write updated params: param += lr * v_t
         """
         beta = self.beta
 
@@ -232,50 +241,48 @@ class GaussNewtonOptimizer:
         v_prev = [d.clone() for d in self.direction]
 
         for i in range(len(self.params)):
-            grad = self.grad_accum[i]
+            tilde_g = self.grad_accum[i]
 
-            # 1. EMA update: m_t = β * m_{t-1} + (1-β) * grad
-            self.ema_m[i].lerp_(grad, 1 - beta)
-            m_t = self.ema_m[i]
-
-            # 2. Compute LMO direction s_t
+            # 1. Compute LMO direction s_t (tilde_g fed directly, no EMA)
             if self.groups[i] == 'matrix':
-                s_t = self._muon_lmo(m_t, i)
+                s_t = self._muon_lmo(tilde_g, i)
             else:
-                s_t = self._adam_lmo(m_t, i)
+                s_t = self._adam_lmo(tilde_g, i)
 
-            # 3. Convex combination: v_t = β * v_prev + (1-β) * s_t
+            # 2. Convex combination: v_t = β * v_prev + (1-β) * s_t
             self.direction[i].copy_(beta * v_prev[i] + (1 - beta) * s_t)
 
-            # 4. Apply to model params: param += lr_scale * v_t
-            # The direction IS the update (inner_lr is already baked into s_t)
-            self.params[i].data.add_(self.direction[i], alpha=lr_scale)
+            # 3. Apply to model params: param += group_lr * v_t
+            group_lr = self.group_lrs[self.groups[i]]
+            self.params[i].data.add_(self.direction[i], alpha=group_lr)
 
-    def _muon_lmo(self, m_t: Tensor, idx: int) -> Tensor:
-        """Muon LMO: Newton-Schulz orthogonalization with Nesterov momentum."""
+    def _muon_lmo(self, tilde_g: Tensor, idx: int) -> Tensor:
+        """Muon LMO: Newton-Schulz orthogonalization with Nesterov momentum.
+        Returns a direction (no lr scaling); lr is applied at param update."""
         buf = self.muon_buf[idx]
-        muon_beta = 0.95
+        momentum = self.muon_momentum
 
-        # Momentum update
-        buf.lerp_(m_t, 1 - muon_beta)
+        # Momentum update (standard SGD momentum: buf = β*buf + g)
+        buf.mul_(momentum).add_(tilde_g)
 
-        # Nesterov: g_eff = m_t + momentum * buf
-        g_eff = m_t + muon_beta * buf
+        # Nesterov: g_eff = g + β * buf
+        g_eff = tilde_g.add(buf, alpha=momentum)
 
         # Newton-Schulz orthogonalization
         normalized = _zeropower_via_newtonschulz5(g_eff, steps=self.muon_backend_steps)
 
-        # Scale correction
+        # Scale correction (same as original Muon)
         lr_ratio = max(1, g_eff.size(0) / g_eff.size(1)) ** 0.5
 
-        return -self.inner_lr * lr_ratio * normalized.to(dtype=m_t.dtype)
+        return -lr_ratio * normalized.to(dtype=tilde_g.dtype)
 
-    def _adam_lmo(self, m_t: Tensor, idx: int) -> Tensor:
-        """Adam LMO for scalar/embedding/head parameters."""
+    def _adam_lmo(self, tilde_g: Tensor, idx: int) -> Tensor:
+        """Adam LMO for scalar/embedding/head parameters.
+        Returns a direction (no lr scaling); lr is applied at param update."""
         state = self.adam_state[idx]
-        adam_beta1 = 0.9
-        adam_beta2 = 0.95
-        adam_eps = 1e-8
+        beta1 = self.adam_beta1
+        beta2 = self.adam_beta2
+        eps = self.adam_eps
 
         state['step'] += 1
         step = state['step']
@@ -283,10 +290,10 @@ class GaussNewtonOptimizer:
         exp_avg = state['exp_avg']
         exp_avg_sq = state['exp_avg_sq']
 
-        exp_avg.mul_(adam_beta1).add_(m_t, alpha=1 - adam_beta1)
-        exp_avg_sq.mul_(adam_beta2).addcmul_(m_t, m_t, value=1 - adam_beta2)
+        exp_avg.mul_(beta1).add_(tilde_g, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(tilde_g, tilde_g, value=1 - beta2)
 
-        m_hat = exp_avg / (1 - adam_beta1 ** step)
-        v_hat = exp_avg_sq / (1 - adam_beta2 ** step)
+        m_hat = exp_avg / (1 - beta1 ** step)
+        v_hat = exp_avg_sq / (1 - beta2 ** step)
 
-        return -self.inner_lr * m_hat / (v_hat.sqrt() + adam_eps)
+        return -m_hat / (v_hat.sqrt() + eps)
